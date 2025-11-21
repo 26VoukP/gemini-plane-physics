@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NYC Day Skyline 3D (Physics Enabled) with Impact Effects</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Inter', sans-serif; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: black; 
+            font-family: sans-serif;
+            font-size: 14px;
+            background: rgba(255,255,255,0.85);
+            padding: 8px;
+            pointer-events: none;
+            user-select: none;
+            border-radius: 4px;
+        }
+        #controls-ui {
+            position: absolute;
+            top: 50px;
+            left: 10px;
+            z-index: 10;
+        }
+        button {
+            background: #cc3333;
+            color: white;
+            border: 1px solid rgba(255,255,255,0.3);
+            padding: 8px 15px;
+            cursor: pointer;
+            font-family: sans-serif;
+            font-weight: bold;
+            border-radius: 4px;
+            text-transform: uppercase;
+            font-size: 12px;
+            outline: none;
+            transition: background 0.3s;
+        }
+        button:hover { opacity: 0.9; }
+        button.active { background: #33cc66; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        WASD: Apply Thrust/Yaw | Arrows: Pitch | Q/E: Roll <br>
+        **Impact Warning:** Camera shake is now extremely violent!
+    </div>
+    <div id="controls-ui">
+        <button id="pilotBtn">Start Pilot Mode</button>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <!-- Cannon.js for Physics -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+
+    <script>
+        let scene, camera, renderer, controls;
+        let waterMesh, planeGroup, tailLight;
+        
+        // Physics variables
+        let world, planeBody, buildingBodies = [];
+        const timeStep = 1 / 60; // Physics refresh rate
+
+        // Camera Shake Variables
+        let cameraShakeIntensity = 0; // Current decay factor (0 to 1)
+        let maxShakeIntensity = 0;    // Max amplitude of the shake
+        let shakeDuration = 0;        // Total duration of the current shake
+        let shakeTime = 0;            // Time elapsed in current shake cycle
+        const SHAKE_DISPLACEMENT_MULTIPLIER = 25; // Greatly increases camera displacement
+        
+        // Particle Variables
+        let particles = [];
+        let fireClouds = []; // NEW: Array to manage fiery cloud effects
+        const rubbleParticleCount = 200;
+
+        let keys = { 
+            w: false, a: false, s: false, d: false, 
+            q: false, e: false, 
+            arrowup: false, arrowdown: false 
+        };
+        let isPilotMode = false;
+
+        function init() {
+            // 1. Setup Scene (Daytime Colors)
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x7ec0ee); // Light Sky Blue
+            scene.fog = new THREE.FogExp2(0x7ec0ee, 0.0008); 
+
+            // 2. Setup Camera
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 1000);
+            camera.position.set(-100, 60, 250);
+
+            // 3. Setup Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. Controls
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.maxPolarAngle = Math.PI / 2 - 0.05;
+            controls.minDistance = 50;
+            controls.maxDistance = 500;
+
+            // 5. Physics Initialization
+            setupPhysics();
+
+            // 6. Lighting
+            setupLighting();
+
+            // 7. Create Objects
+            createWater(); // Water is now the ground plane for physics
+            createSun(); 
+            createCity();
+            createPlane();
+
+            // 8. Event Listeners
+            window.addEventListener('resize', onWindowResize, false);
+            
+            window.focus();
+            document.body.addEventListener('click', () => window.focus());
+
+            document.addEventListener('keydown', (e) => {
+                if (!isPilotMode) return;
+                
+                const key = e.key.toLowerCase();
+                // Check for WASD, QE, and Arrow keys
+                if (keys.hasOwnProperty(key) || ['arrowup', 'arrowdown'].includes(key)) {
+                    keys[key] = true;
+                    e.preventDefault(); 
+                }
+            });
+            document.addEventListener('keyup', (e) => {
+                if (!isPilotMode) return;
+
+                const key = e.key.toLowerCase();
+                if (keys.hasOwnProperty(key) || ['arrowup', 'arrowdown'].includes(key)) {
+                    keys[key] = false;
+                }
+            });
+
+            // UI Button Listener
+            const btn = document.getElementById('pilotBtn');
+            btn.addEventListener('click', () => {
+                isPilotMode = !isPilotMode;
+                if (isPilotMode) {
+                    btn.innerText = "Stop Pilot Mode";
+                    btn.classList.add('active');
+                    // Reset controls and focus
+                    keys = { 
+                        w: false, a: false, s: false, d: false,
+                        q: false, e: false,
+                        arrowup: false, arrowdown: false
+                    };
+                    window.focus();
+                } else {
+                    btn.innerText = "Start Pilot Mode";
+                    btn.classList.remove('active');
+                }
+            });
+            
+            animate();
+        }
+        
+        // --- PHYSICS SETUP ---
+
+        function setupPhysics() {
+            world = new CANNON.World();
+            // Standard Earth gravity for buildings
+            world.gravity.set(0, -9.82, 0); 
+            world.broadphase = new CANNON.NaiveBroadphase();
+            // Increased solver iterations for better stability
+            world.solver.iterations = 20; 
+
+            // Define Physics Materials
+            const slipperyMaterial = new CANNON.Material("slippery");
+            const generalMaterial = new CANNON.Material("general");
+
+            // Contact material: Building vs Ground (Slippery)
+            world.addContactMaterial(new CANNON.ContactMaterial(
+                slipperyMaterial, 
+                slipperyMaterial, 
+                { friction: 0.0, restitution: 0.1 } // Very low friction for sliding
+            ));
+
+            // Contact material: Plane/Active Building vs Static Building (High impact but bouncy)
+             world.addContactMaterial(new CANNON.ContactMaterial(
+                generalMaterial, 
+                slipperyMaterial, 
+                { friction: 0.5, restitution: 0.8 } // Bouncy collisions
+            ));
+        }
+        
+        // Helper function to create a Cannon Body for a Three.js Mesh
+        function createPhysicsBody(mesh, originalMass, isStatic = false, material = null) {
+            const size = mesh.scale;
+            const shape = new CANNON.Box(new CANNON.Vec3(size.x / 2, size.y / 2, size.z / 2));
+            
+            let yPos = mesh.position.y;
+            
+            // If it's a building (not static ground) we ensure it's slightly off the ground
+            if (!isStatic && originalMass > 0) {
+                yPos += 0.01; 
+            }
+
+            // All buildings start as STATIC bodies with 0 mass
+            const initialMass = 0; 
+            const initialType = CANNON.Body.STATIC; 
+
+            const body = new CANNON.Body({
+                mass: initialMass,
+                position: new CANNON.Vec3(mesh.position.x, yPos, mesh.position.z),
+                material: material,
+                type: initialType, 
+                linearDamping: 0.1, 
+                angularDamping: 0.1
+            });
+            body.addShape(shape);
+            
+            // Store the intended dynamic mass and a flag to identify buildings
+            if (!isStatic && originalMass > 0) {
+                body.isBuilding = true;
+                body.originalMass = originalMass;
+            }
+
+            world.addBody(body);
+            return body;
+        }
+
+        /**
+         * Activates a static building by setting its mass, type, and applying an impulse.
+         * @param {CANNON.Body} buildingBody - The static building body to activate.
+         * @param {CANNON.Body} impactBody - The dynamic body that struck the building.
+         * @param {Object} contact - The contact information from the collision event.
+         */
+        function activateBuilding(buildingBody, impactBody, contact) {
+            console.log('Building activated by impact! Domino effect initiated.');
+            
+            // 1. Set the mass to the original intended dynamic mass
+            buildingBody.mass = buildingBody.originalMass;
+            
+            // 2. Change the type from STATIC to DYNAMIC
+            buildingBody.type = CANNON.Body.DYNAMIC;
+            
+            // 3. Update physics properties (mandatory after changing mass)
+            buildingBody.updateMassProperties();
+
+            // 4. Give it an impulse based on the impact body's velocity
+            const impactVelocity = impactBody.velocity;
+            const impulseFactor = 5; 
+            
+            // Set initial velocity based on the impact body's velocity
+            buildingBody.velocity.set(impactVelocity.x * 0.1, impactVelocity.y * 0.1, impactVelocity.z * 0.1); 
+            
+            // Apply impulse to the building
+            buildingBody.applyImpulse(
+                new CANNON.Vec3(
+                    impactVelocity.x * impulseFactor,
+                    impactVelocity.y * impulseFactor * 0.5, 
+                    impactVelocity.z * impulseFactor
+                ),
+                // Use the contact point for realistic hit location (e.contact.ri is the vector from center to collision point on *e.target*)
+                contact.ri 
+            );
+        }
+
+        /**
+         * Collision handler attached to all building bodies.
+         */
+        function onAnyBuildingCollide(e) {
+            const staticBuilding = e.target;
+            const impactBody = e.body; // The object that hit the building
+            
+            // Only care about impacts involving the plane (mass 100)
+            if (impactBody.mass !== 100 && !impactBody.isBuilding) return; 
+
+            // Calculate relative velocity magnitude for shake/impulse
+            const relVel = new CANNON.Vec3();
+            relVel.vsub(impactBody.velocity, staticBuilding.velocity);
+            const relVelMagnitude = relVel.length();
+            
+            // Find world contact position
+            const contactPos = new THREE.Vector3().copy(staticBuilding.position);
+
+            // 1. Create Impact Visual Effects
+            if (relVelMagnitude > 5) { // Only trigger effects on significant impacts
+                // Creates a fiery cloud effect
+                createFieryCloud(contactPos, relVelMagnitude * 0.5); 
+                // Creates rubble/dust particles
+                createExplosionParticles(contactPos, relVelMagnitude * 0.8, 0xaaaaaa); 
+            }
+            
+            // 2. Apply Camera Shake
+            const shakeFactor = Math.min(1.0, relVelMagnitude / 35); 
+            if (shakeFactor > 0.15) {
+                if (shakeFactor > maxShakeIntensity) { 
+                    maxShakeIntensity = shakeFactor * 2.5; 
+                    shakeDuration = 0.5 + shakeFactor * 1.5; 
+                    shakeTime = 0; 
+                    cameraShakeIntensity = 1.0; 
+                }
+            }
+
+
+            // 3. Activate Building
+            if (staticBuilding.isBuilding && staticBuilding.mass === 0) {
+                if (impactBody.mass > 0) {
+                    activateBuilding(staticBuilding, impactBody, e.contact);
+                }
+            }
+        }
+
+        // --- PARTICLE SYSTEM ---
+        
+        /**
+         * Creates a fiery cloud effect that expands and fades.
+         * Uses a sphere of particles with additive blending and varying sizes/colors.
+         * @param {THREE.Vector3} position - Center of the fire cloud.
+         * @param {number} strength - Scale of the initial explosion radius/lifetime.
+         */
+        function createFieryCloud(position, strength) {
+            const cloudSize = 10 + strength * 2;
+            const maxLifetime = 1.0 + strength * 0.2;
+            const cloudParticleCount = 150;
+            
+            const particleGroup = new THREE.Group();
+            particleGroup.position.copy(position);
+            scene.add(particleGroup);
+
+            // Use vertex colors for a fiery blend (yellow, orange, red)
+            const material = new THREE.PointsMaterial({
+                size: cloudSize / 10,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                transparent: true,
+                opacity: 1.0,
+                sizeAttenuation: true
+            });
+
+            const geometry = new THREE.BufferGeometry();
+            const positions = [];
+            const colors = [];
+            
+            const color1 = new THREE.Color(0xffaa00); // Orange
+            const color2 = new THREE.Color(0xff4400); // Red
+            const color3 = new THREE.Color(0xffffff); // White/Yellow Core
+
+            for (let i = 0; i < cloudParticleCount; i++) {
+                // Randomly distribute particles in a sphere
+                const radius = Math.random() * cloudSize * 0.5;
+                const phi = Math.random() * Math.PI * 2;
+                const theta = Math.acos(Math.random() * 2 - 1);
+                
+                positions.push(
+                    radius * Math.sin(theta) * Math.cos(phi),
+                    radius * Math.sin(theta) * Math.sin(phi),
+                    radius * Math.cos(theta)
+                );
+                
+                // Assign color based on distance or random blend
+                const mix = Math.random();
+                if (mix < 0.3) color1.toArray(colors, i * 3);
+                else if (mix < 0.6) color2.toArray(colors, i * 3);
+                else color3.toArray(colors, i * 3);
+            }
+            
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            
+            const mesh = new THREE.Points(geometry, material);
+            particleGroup.add(mesh);
+
+            fireClouds.push({
+                group: particleGroup,
+                mesh: mesh,
+                geometry: geometry,
+                material: material,
+                lifetime: 0,
+                maxLifetime: maxLifetime,
+                initialSize: material.size
+            });
+        }
+        
+        /**
+         * Creates a dust/rubble particle explosion effect.
+         * @param {THREE.Vector3} position - Center of the explosion.
+         * @param {number} strength - Initial velocity scale.
+         * @param {number} color - Particle color.
+         */
+        function createExplosionParticles(position, strength, color) {
+            const particleGroup = new THREE.Group();
+            particleGroup.position.copy(position);
+            scene.add(particleGroup);
+            
+            const material = new THREE.PointsMaterial({
+                color: color,
+                size: 1.0,
+                blending: THREE.NormalBlending, // Rubble uses normal blending
+                transparent: true,
+                opacity: 1.0
+            });
+            
+            const geometry = new THREE.BufferGeometry();
+            const positions = [];
+            const velocities = [];
+            
+            for (let i = 0; i < rubbleParticleCount; i++) {
+                positions.push(0, 0, 0); // Start at group center
+                
+                const v = new THREE.Vector3(
+                    (Math.random() - 0.5) * strength,
+                    Math.random() * strength * 0.5,
+                    (Math.random() - 0.5) * strength
+                );
+                // Store velocity (x, y, z)
+                velocities.push(v.x, v.y, v.z);
+            }
+            
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            const mesh = new THREE.Points(geometry, material);
+            particleGroup.add(mesh);
+
+            particles.push({
+                group: particleGroup,
+                mesh: mesh,
+                geometry: geometry,
+                material: material,
+                velocities: velocities,
+                lifetime: 0,
+                maxLifetime: 1.5 + Math.random() * 1.5,
+                strength: strength
+            });
+        }
+
+        function updateParticles(delta) {
+            // Update Rubble Particles
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.lifetime += delta;
+                
+                if (p.lifetime > p.maxLifetime) {
+                    scene.remove(p.group);
+                    p.geometry.dispose();
+                    p.material.dispose();
+                    particles.splice(i, 1);
+                    continue;
+                }
+
+                const positions = p.geometry.attributes.position.array;
+                const velocities = p.velocities;
+
+                // Decrease opacity and size over life
+                p.material.opacity = Math.max(0, 1 - (p.lifetime / p.maxLifetime));
+                p.material.size = Math.max(0.1, 1.0 * (1 - p.lifetime / p.maxLifetime));
+
+                for (let j = 0; j < rubbleParticleCount; j++) {
+                    const index = j * 3;
+                    
+                    // Apply gravity/drag to velocity
+                    velocities[index + 1] -= 9.8 * delta * 0.5;
+                    
+                    // Update position relative to the group center (which is the collision point)
+                    positions[index + 0] += velocities[index + 0] * delta;
+                    positions[index + 1] += velocities[index + 1] * delta;
+                    positions[index + 2] += velocities[index + 2] * delta;
+                }
+
+                p.geometry.attributes.position.needsUpdate = true;
+            }
+            
+            // NEW: Update Fiery Clouds
+            for (let i = fireClouds.length - 1; i >= 0; i--) {
+                const cloud = fireClouds[i];
+                cloud.lifetime += delta;
+
+                if (cloud.lifetime > cloud.maxLifetime) {
+                    scene.remove(cloud.group);
+                    cloud.geometry.dispose();
+                    cloud.material.dispose();
+                    fireClouds.splice(i, 1);
+                    continue;
+                }
+                
+                const progress = cloud.lifetime / cloud.maxLifetime;
+                
+                // Fade out the fire cloud (opacity and size)
+                cloud.material.opacity = Math.max(0, 1.0 - progress * 1.5); // Fade slightly faster than lifetime
+                cloud.mesh.scale.setScalar(1 + progress * 2); // Expand the cloud size
+            }
+        }
+
+        // --- THREE.JS OBJECT CREATION (Modified to include physics bodies) ---
+
+        function setupLighting() {
+            // Day Lighting setup
+            const ambientLight = new THREE.AmbientLight(0xcceeff, 0.5); 
+            scene.add(ambientLight);
+
+            const sunLight = new THREE.DirectionalLight(0xffffff, 4.0);
+            sunLight.position.set(100, 200, 150); 
+            sunLight.castShadow = true;
+            sunLight.shadow.camera.left = -200;
+            sunLight.shadow.camera.right = 200;
+            sunLight.shadow.camera.top = 200;
+            sunLight.shadow.camera.bottom = -200;
+            sunLight.shadow.mapSize.width = 4096; 
+            sunLight.shadow.mapSize.height = 4096;
+            sunLight.shadow.bias = -0.0001;
+            scene.add(sunLight);
+
+            const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x000000, 0.5); 
+            scene.add(hemisphereLight);
+        }
+
+        function createBuildingTexture(width, height, isTwinTower = false) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+
+            if (isTwinTower) {
+                ctx.fillStyle = '#4a4a55';
+            } else {
+                ctx.fillStyle = Math.random() > 0.5 ? '#666666' : '#777777';
+            }
+            ctx.fillRect(0, 0, 128, 256);
+
+            const rows = 30;
+            const cols = 10;
+            const w = 128 / cols;
+            const h = 256 / rows;
+
+            for (let y = 0; y < rows; y++) {
+                for (let x = 0; x < cols; x++) {
+                    if (isTwinTower) {
+                        ctx.fillStyle = '#666';
+                        ctx.fillRect(x * w, 0, 2, 256);
+                    }
+                    
+                    if (Math.random() > 0.05) { 
+                        ctx.fillStyle = isTwinTower ? '#334455' : '#111111'; 
+                        
+                    } else {
+                        ctx.fillStyle = '#999999'; 
+                    }
+
+                    if (isTwinTower) {
+                         ctx.fillRect(x * w + 2, y * h + 1, w - 4, h - 2);
+                    } else {
+                         ctx.fillRect(x * w + 2, y * h + 2, w - 4, h - 4);
+                    }
+                }
+            }
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            return texture;
+        }
+        
+        // Function to create a building (Three.js Mesh + Cannon.js Body)
+        function createBuilding(position, scale, texture, isStatic = false) {
+            const geometryCache = new THREE.BoxGeometry(1, 1, 1);
+            const material = new THREE.MeshStandardMaterial({
+                map: texture,
+                roughness: 0.3,
+                metalness: 0.1,
+                emissive: 0x000000
+            });
+            
+            const mesh = new THREE.Mesh(geometryCache, material);
+            mesh.position.set(position.x, position.y, position.z);
+            mesh.scale.set(scale.x, scale.y, scale.z);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+
+            // Calculate the intended dynamic mass
+            const buildingMass = isStatic ? 0 : scale.x * scale.y * scale.z * 0.1; 
+            
+            // Pass the intended mass. The physics body will start static (mass 0) and activate on collision.
+            const body = createPhysicsBody(mesh, buildingMass, isStatic, world.materials[0]); 
+            
+            // Attach collision listener to the building body to enable domino effects
+            if (body.isBuilding) {
+                body.addEventListener('collide', onAnyBuildingCollide);
+            }
+
+            buildingBodies.push({ mesh, body });
+        }
+
+
+        function createCity() {
+            // Reusable texture for generic buildings
+            const genericTexture = createBuildingTexture(128, 256);
+            
+            // Tall Towers (Tower 1 and 2)
+            const wtcTexture = createBuildingTexture(64, 256, true);
+            createBuilding({ x: 20, y: 75, z: 0 }, { x: 18, y: 150, z: 18 }, wtcTexture, false);
+            createBuilding({ x: 45, y: 75, z: 20 }, { x: 18, y: 150, z: 18 }, wtcTexture, false);
+
+            // Spire Base (Base is dynamic, top is part of base)
+            createBuilding({ x: -60, y: 40, z: 10 }, { x: 15, y: 80, z: 15 }, genericTexture, false);
+            
+            // Spire Top (Attached to the base's mesh, but should be treated as one dynamic body for collision)
+            // Since CANNON.js doesn't easily handle compound shapes on dynamic bodies without complex setup, 
+            // we'll approximate the collision using the base box body.
+            const spireTopGeo = new THREE.ConeGeometry(6, 20, 4);
+            const spireTopMat = new THREE.MeshStandardMaterial({color: 0xaaaaaa, emissive: 0x000000});
+            const spireTop = new THREE.Mesh(spireTopGeo, spireTopMat);
+            spireTop.position.set(-60, 90, 10);
+            scene.add(spireTop);
+
+
+            // Random smaller buildings
+            for (let i = 0; i < 80; i++) {
+                const w = 5 + Math.random() * 10;
+                const d = 5 + Math.random() * 10;
+                const h = 20 + Math.random() * 60;
+
+                let x = (Math.random() - 0.5) * 300;
+                let z = (Math.random() - 0.5) * 150;
+                
+                if (z > 30) z = -z; 
+
+                if (Math.abs(x - 30) < 30 && Math.abs(z) < 30) continue; // Avoid center
+
+                // Reuse the same texture for performance
+                createBuilding({ x: x, y: h / 2, z: z }, { x: w, y: h, z: d }, genericTexture, false);
+            }
+
+            // WFC complex
+            const wfcMat = new THREE.MeshStandardMaterial({ color: 0x445566, roughness: 0.2 });
+            
+            // WFC 1
+            const wfc1Mesh = new THREE.Mesh(new THREE.BoxGeometry(25, 40, 25), wfcMat);
+            wfc1Mesh.position.set(0, 20, 50);
+            scene.add(wfc1Mesh);
+            // WFC 1 Body creation
+            const wfc1Body = createPhysicsBody(wfc1Mesh, 25 * 40 * 25 * 0.1, false, world.materials[0]);
+            buildingBodies.push({ mesh: wfc1Mesh, body: wfc1Body }); // Added to list of dynamic bodies
+            wfc1Body.addEventListener('collide', onAnyBuildingCollide);
+
+            // WFC 2
+            const wfc2Mesh = new THREE.Mesh(new THREE.BoxGeometry(25, 30, 25), wfcMat);
+            wfc2Mesh.position.set(35, 15, 55);
+            scene.add(wfc2Mesh);
+            
+            // WFC 2 Body creation
+            const wfc2Body = createPhysicsBody(wfc2Mesh, 25 * 30 * 25 * 0.1, false, world.materials[0]);
+            buildingBodies.push({ mesh: wfc2Mesh, body: wfc2Body }); // Added to list of dynamic bodies
+            wfc2Body.addEventListener('collide', onAnyBuildingCollide);
+
+        }
+
+        function createWater() {
+            const geometry = new THREE.PlaneGeometry(1000, 500, 64, 64);
+            const material = new THREE.MeshStandardMaterial({
+                color: 0x0088ff, 
+                roughness: 0.1,
+                metalness: 0.5,
+                side: THREE.DoubleSide
+            });
+
+            waterMesh = new THREE.Mesh(geometry, material);
+            waterMesh.rotation.x = -Math.PI / 2;
+            waterMesh.position.y = 0;
+            waterMesh.receiveShadow = true;
+            scene.add(waterMesh);
+            
+            // Create a static ground plane body for buildings to sit on (This remains permanently static)
+            const groundShape = new CANNON.Plane();
+            const groundBody = new CANNON.Body({ mass: 0, material: world.materials[0] }); // slipperyMaterial
+            groundBody.addShape(groundShape);
+            groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2); // Rotate to lie on XY plane (Y=0)
+            world.addBody(groundBody);
+        }
+
+        function createSun() {
+            const geometry = new THREE.SphereGeometry(15, 32, 32);
+            const material = new THREE.MeshBasicMaterial({ color: 0xffffaa }); 
+            const sun = new THREE.Mesh(geometry, material);
+            
+            sun.position.set(200, 150, -250); 
+            scene.add(sun);
+
+            const canvas = document.createElement('canvas');
+            canvas.width = 128; canvas.height = 128;
+            const context = canvas.getContext('2d');
+            const gradient = context.createRadialGradient(64, 64, 0, 64, 64, 64);
+            gradient.addColorStop(0, 'rgba(255, 255, 200, 1)'); 
+            gradient.addColorStop(1, 'rgba(255, 255, 200, 0)');
+            context.fillStyle = gradient;
+            context.fillRect(0, 0, 128, 128);
+            
+            const spriteMaterial = new THREE.SpriteMaterial({ 
+                map: new THREE.CanvasTexture(canvas), 
+                transparent: true,
+                blending: THREE.AdditiveBlending
+            });
+            const sprite = new THREE.Sprite(spriteMaterial);
+            sprite.scale.set(100, 100, 1);
+            sun.add(sprite);
+        }
+
+        function createPlane() {
+            planeGroup = new THREE.Group();
+            const planeMat = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.8, roughness: 0.2 });
+
+            const fuselageLength = 10;
+            const fuselageRadius = 1.2;
+
+            // Fuselage (Cylinder aligned along X)
+            const fuselageGeo = new THREE.CylinderGeometry(fuselageRadius, fuselageRadius, fuselageLength, 16);
+            const fuselage = new THREE.Mesh(fuselageGeo, planeMat);
+            fuselage.rotation.z = Math.PI / 2; 
+            planeGroup.add(fuselage);
+
+            // Nose Cone
+            const noseLength = 2.5;
+            const noseGeo = new THREE.ConeGeometry(fuselageRadius, noseLength, 16);
+            const nose = new THREE.Mesh(noseGeo, planeMat);
+            nose.rotation.z = -Math.PI / 2; 
+            nose.position.x = fuselageLength / 2 + noseLength / 2;
+            planeGroup.add(nose);
+
+            // Main Wings
+            const mainWingSpan = 14;
+            const mainWingDepth = 3.5; 
+            const mainWingThickness = 0.3; 
+            const mainWingBodyGeo = new THREE.BoxGeometry(mainWingDepth, mainWingThickness, mainWingSpan);
+            const mainWings = new THREE.Mesh(mainWingBodyGeo, planeMat);
+            mainWings.position.x = 0; 
+            planeGroup.add(mainWings);
+
+            // Remaining plane parts (simplified for this example, just add them to the group)
+
+            // Vertical Stabilizer (Tail Fin)
+            const verticalTailHeight = 2.5;
+            const verticalTailDepth = 2; 
+            const verticalTailWidth = 0.5; 
+            const verticalTailGeo = new THREE.BoxGeometry(verticalTailDepth, verticalTailHeight, verticalTailWidth); 
+            const verticalTail = new THREE.Mesh(verticalTailGeo, planeMat);
+            verticalTail.position.set(-(fuselageLength / 2 - 1), fuselageRadius / 2 + verticalTailHeight / 2, 0);
+            planeGroup.add(verticalTail);
+
+            // Blinking Red Tail Light
+            tailLight = new THREE.PointLight(0xff0000, 0, 5); 
+            tailLight.position.set(-(fuselageLength / 2 - 1), fuselageRadius / 2 + verticalTailHeight + 0.5, 0);
+            planeGroup.add(tailLight);
+
+            // Plane Front Light
+            const planeFrontLight = new THREE.PointLight(0xffffff, 0.5, 50);
+            planeFrontLight.position.set(fuselageLength / 2 + noseLength, 0, 0); 
+            planeGroup.add(planeFrontLight);
+
+            planeGroup.scale.set(3, 3, 3);
+            scene.add(planeGroup);
+
+            // --- CANNON.JS Plane Body ---
+            const planeCollisionShape = new CANNON.Box(new CANNON.Vec3(
+                (fuselageLength + noseLength) * 3 / 2, // Length (X)
+                fuselageRadius * 3, // Height (Y)
+                mainWingSpan * 3 / 2 // Width (Z)
+            ));
+
+            planeBody = new CANNON.Body({
+                mass: 100, // Dynamic mass
+                position: new CANNON.Vec3(100, 120, 0),
+                material: world.materials[1], // generalMaterial
+                linearDamping: 0.8, // Drags in air
+                angularDamping: 0.95
+            });
+            planeBody.addShape(planeCollisionShape);
+
+            // Initial rotation (face towards city, along -X)
+            planeBody.quaternion.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), Math.PI); 
+
+            world.addBody(planeBody);
+        }
+
+        // --- ANIMATION AND PHYSICS STEP ---
+        
+        const forceMagnitude = 500;
+        const angularForceMagnitude = 100;
+        const localVector = new CANNON.Vec3(); // Reusable vector
+
+        function handlePlaneControls() {
+            if (!planeBody) return;
+
+            // Reset linear velocity every frame to make controls feel direct, like a hovercraft/futuristic plane
+            planeBody.velocity.set(0, 0, 0); 
+
+            // Get the plane's current orientation (Forward vector is local -X in Three.js, but Cannon uses its own local axis)
+            const quat = planeBody.quaternion;
+            const forward = new CANNON.Vec3(1, 0, 0).vsub(new CANNON.Vec3(0, 0, 0));
+            quat.vmult(forward, forward);
+            
+            // Set the linear thrust speed
+            const thrustSpeed = isPilotMode ? 100 : 0;
+            
+            // Thrust/Brake (W/S)
+            if (keys.w) {
+                // Apply thrust in the forward direction
+                planeBody.velocity.x = forward.x * thrustSpeed;
+                planeBody.velocity.y = forward.y * thrustSpeed;
+                planeBody.velocity.z = forward.z * thrustSpeed;
+            } else if (keys.s) {
+                // Apply thrust in the reverse direction (Brake/Reverse)
+                planeBody.velocity.x = -forward.x * thrustSpeed * 0.5;
+                planeBody.velocity.y = -forward.y * thrustSpeed * 0.5;
+                planeBody.velocity.z = -forward.z * thrustSpeed * 0.5;
+            }
+
+            // Angular Velocity (Yaw/Pitch/Roll)
+            // Yaw (A/D - Rotation around Local Y)
+            if (keys.a) planeBody.angularVelocity.y = 1.5;
+            else if (keys.d) planeBody.angularVelocity.y = -1.5;
+            else planeBody.angularVelocity.y = 0; // Stop yawing
+
+            // Pitch (Arrows - Rotation around Local Z)
+            if (keys.arrowup) planeBody.angularVelocity.z = 1.0;
+            else if (keys.arrowdown) planeBody.angularVelocity.z = -1.0;
+            else planeBody.angularVelocity.z = 0; // Stop pitching
+
+            // Roll (Q/E - Rotation around Local X)
+            if (keys.q) planeBody.angularVelocity.x = 2.0;
+            else if (keys.e) planeBody.angularVelocity.x = -2.0;
+            else planeBody.angularVelocity.x = 0; // Stop rolling
+        }
+
+        let baseCameraPosition = new THREE.Vector3();
+        let shakeOffset = new THREE.Vector3();
+
+        function handleCameraShake(delta) {
+            if (cameraShakeIntensity > 0) {
+                shakeTime += delta;
+                
+                // Decay the shake intensity over the duration
+                const decayFactor = 1.0 - (shakeTime / shakeDuration);
+                cameraShakeIntensity = Math.max(0, decayFactor);
+
+                if (cameraShakeIntensity === 0) {
+                    shakeTime = 0;
+                    maxShakeIntensity = 0;
+                    return;
+                }
+                
+                // Calculate the current maximum shake displacement
+                // VIOLENCE MODIFICATION: Multiplier 25 for extremely violent shake
+                const currentShakeDisplacement = maxShakeIntensity * cameraShakeIntensity * SHAKE_DISPLACEMENT_MULTIPLIER; 
+
+                // Apply a random, high-frequency offset to the camera position
+                shakeOffset.set(
+                    (Math.random() * 2 - 1) * currentShakeDisplacement,
+                    (Math.random() * 2 - 1) * currentShakeDisplacement,
+                    (Math.random() * 2 - 1) * currentShakeDisplacement
+                );
+
+                // Apply shake offset to the base camera position
+                camera.position.add(shakeOffset);
+            }
+        }
+
+        function syncMeshes() {
+            // 1. Sync Plane
+            if (planeGroup && planeBody) {
+                planeGroup.position.copy(planeBody.position);
+                planeGroup.quaternion.copy(planeBody.quaternion);
+            }
+
+            // 2. Sync Buildings
+            for (const { mesh, body } of buildingBodies) {
+                mesh.position.copy(body.position);
+                mesh.quaternion.copy(body.quaternion);
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        let blinkTimer = 0;
+        const blinkInterval = 0.5; 
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = 0.016; 
+
+            // 1. Physics step and controls
+            world.step(timeStep);
+            handlePlaneControls();
+            
+            // 2. Update particle systems (rubble and fire clouds)
+            updateParticles(delta);
+
+            // 3. Store pre-shake camera position for shake calculation
+            baseCameraPosition.copy(camera.position);
+
+            // 4. Orbit controls update (updates position/target)
+            controls.update();
+            
+            // 5. Apply Camera Shake after controls update
+            handleCameraShake(delta);
+
+            // 6. Keep camera fixed relative to plane in pilot mode 
+            if (isPilotMode && planeBody) {
+                 const newPos = new THREE.Vector3().copy(planeBody.position).add(new THREE.Vector3(-30, 10, 0).applyQuaternion(planeBody.quaternion));
+                 
+                 // Interpolate to the new position
+                 camera.position.lerp(newPos, 0.1); 
+                 
+                 // Look at the plane center
+                 camera.lookAt(planeBody.position.x, planeBody.position.y, planeBody.position.z);
+                 
+                 // Re-apply shake on top of pilot mode follow
+                 if (cameraShakeIntensity > 0) {
+                    camera.position.add(shakeOffset);
+                 }
+            }
+
+
+            // 7. Sync meshes to physics bodies
+            syncMeshes();
+
+            // 8. Blinking Tail Light
+            if (tailLight) {
+                blinkTimer += delta;
+                if (blinkTimer >= blinkInterval) {
+                    tailLight.intensity = (tailLight.intensity > 0) ? 0 : 0.5; 
+                    blinkTimer = 0;
+                }
+            }
+
+            // 9. Simple water undulation (visual only)
+            const time = Date.now() * 0.001;
+            if (waterMesh) {
+                const positionAttribute = waterMesh.geometry.attributes.position;
+                for ( let i = 0; i < positionAttribute.count; i ++ ) {
+                    const x = positionAttribute.getX( i );
+                    const y = positionAttribute.getY( i );
+                    // Using time * 0.5 to slow down the ripple effect
+                    const z = Math.sin( x * 0.05 + time * 0.5 ) * 0.5 + Math.sin( y * 0.05 + time * 0.25 ) * 0.5; 
+                    positionAttribute.setZ( i, z );
+                }
+                positionAttribute.needsUpdate = true;
+                waterMesh.geometry.computeVertexNormals();
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        window.onload = function() {
+             init();
+        }
+        
+    </script>
+</body>
+</html>
